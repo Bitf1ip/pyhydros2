@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `DeviceState.output_reservoir_ml` accessor for a dosing pump output's
+  remaining reservoir volume.
+- `DeviceState.output_overridden` accessor for whether an output currently
+  has an active manual override (vs. running on its automatic schedule).
+
 ## [2.0.0] - 2026-09-30
 
 ### Added

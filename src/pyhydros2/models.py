@@ -160,6 +160,22 @@ class DeviceState:
         """Output ``frequency`` converted to hertz (see ``units.centihertz_to_hertz``)."""
         return units.centihertz_to_hertz(self.outputs.get(name, {}).get("frequency"))
 
+    def output_reservoir_ml(self, name: str) -> Optional[float]:
+        """Output ``reservoir`` (remaining liquid, as calibrated in the
+        manufacturer's app) in milliliters -- reported as-is, no unit
+        conversion needed. Only meaningful for dosing pump outputs.
+        """
+        value = self.outputs.get(name, {}).get("reservoir")
+        return float(value) if value is not None else None
+
+    def output_overridden(self, name: str) -> Optional[bool]:
+        """Whether this output currently has an active manual override, as
+        opposed to running on its own schedule/automatic logic (the raw
+        state document's per-output ``override`` flag).
+        """
+        value = self.outputs.get(name, {}).get("override")
+        return bool(value) if value is not None else None
+
     def input_on(self, name: str) -> Optional[bool]:
         """Input ``senseValue`` as on/off (see ``units.raw_level_to_on``).
 
