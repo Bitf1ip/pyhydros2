@@ -18,6 +18,11 @@ from . import units
 OverrideValue = Union[bool, int, None]
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    # The state document is opaque per the API; a non-object where one is expected reads as empty.
+    return value if isinstance(value, dict) else {}
+
+
 @dataclass(frozen=True)
 class Device:
     """A device bound to a device key (``GET /api/v1/device``)."""
@@ -44,7 +49,7 @@ class SessionResponse:
     """Response from ``POST /api/v1/device/state/session``."""
 
     poll_url: str
-    poll_token: str
+    poll_token: str = field(repr=False)
     duration_seconds: int
     poll_interval_seconds: int
     expires_at: datetime
@@ -79,14 +84,35 @@ class DeviceState:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DeviceState":
+        if not isinstance(data, Mapping):
+            raise TypeError(f"expected a JSON object, got {type(data).__name__}")
         return cls(data)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.raw.get(key, default)
 
+    def _output(self, name: str) -> Dict[str, Any]:
+        return _as_dict(self.outputs.get(name))
+
+    def _input(self, name: str) -> Dict[str, Any]:
+        return _as_dict(self.inputs.get(name))
+
     @property
     def mode(self) -> Optional[str]:
         return self.raw.get("mode")
+
+    @property
+    def mode_timeout_seconds(self) -> Optional[float]:
+        """Seconds left on a timed operating mode (e.g. Water Change), else ``None``.
+
+        Read from the undocumented top-level ``timeout`` field, which the live
+        state reports in milliseconds, counting down while a timed mode runs
+        and absent once the device returns to Normal.
+        """
+        value = self.raw.get("timeout")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return None
+        return value / 1000
 
     @property
     def collective_status(self) -> Optional[int]:
@@ -110,19 +136,19 @@ class DeviceState:
 
     @property
     def inputs(self) -> Dict[str, Any]:
-        return self.raw.get("Input") or {}
+        return _as_dict(self.raw.get("Input"))
 
     @property
     def outputs(self) -> Dict[str, Any]:
-        return self.raw.get("Output") or {}
+        return _as_dict(self.raw.get("Output"))
 
     @property
     def health(self) -> Dict[str, Any]:
-        return self.raw.get("health") or {}
+        return _as_dict(self.raw.get("health"))
 
     @property
     def ota_state(self) -> Dict[str, Any]:
-        return self.raw.get("otaState") or {}
+        return _as_dict(self.raw.get("otaState"))
 
     def output_percent(self, name: str) -> Optional[float]:
         """Output ``valueState`` as a 0-100 percent (see ``units.raw_level_to_percent``).
@@ -132,7 +158,7 @@ class DeviceState:
         ``output_percent`` on ``level`` outputs to get a simple running/not
         running indicator (any nonzero ``valueState`` counts as on).
         """
-        return units.raw_level_to_percent(self.outputs.get(name, {}).get("valueState"))
+        return units.raw_level_to_percent(self._output(name).get("valueState"))
 
     def output_on(self, name: str) -> Optional[bool]:
         """Output ``valueState`` as on/off (see ``units.raw_level_to_on``).
@@ -142,30 +168,30 @@ class DeviceState:
         outputs, and also works for ``level`` outputs as a running/not
         running indicator alongside ``output_percent``'s finer-grained value.
         """
-        return units.raw_level_to_on(self.outputs.get(name, {}).get("valueState"))
+        return units.raw_level_to_on(self._output(name).get("valueState"))
 
     def output_voltage_volts(self, name: str) -> Optional[float]:
         """Output ``voltageI`` (supply voltage) converted to volts."""
-        return units.centivolts_to_volts(self.outputs.get(name, {}).get("voltageI"))
+        return units.centivolts_to_volts(self._output(name).get("voltageI"))
 
     def output_current_amps(self, name: str) -> Optional[float]:
         """Output ``current`` converted from milliamps to amps."""
-        return units.milliamps_to_amps(self.outputs.get(name, {}).get("current"))
+        return units.milliamps_to_amps(self._output(name).get("current"))
 
     def output_power_watts(self, name: str) -> Optional[float]:
         """Output ``powerI`` converted to watts."""
-        return units.deciwatts_to_watts(self.outputs.get(name, {}).get("powerI"))
+        return units.deciwatts_to_watts(self._output(name).get("powerI"))
 
     def output_frequency_hz(self, name: str) -> Optional[float]:
         """Output ``frequency`` converted to hertz (see ``units.centihertz_to_hertz``)."""
-        return units.centihertz_to_hertz(self.outputs.get(name, {}).get("frequency"))
+        return units.centihertz_to_hertz(self._output(name).get("frequency"))
 
     def output_reservoir_ml(self, name: str) -> Optional[float]:
         """Output ``reservoir`` (remaining liquid, as calibrated in the
         manufacturer's app) in milliliters -- reported as-is, no unit
         conversion needed. Only meaningful for dosing pump outputs.
         """
-        value = self.outputs.get(name, {}).get("reservoir")
+        value = self._output(name).get("reservoir")
         return float(value) if value is not None else None
 
     def output_overridden(self, name: str) -> Optional[bool]:
@@ -173,7 +199,7 @@ class DeviceState:
         opposed to running on its own schedule/automatic logic (the raw
         state document's per-output ``override`` flag).
         """
-        value = self.outputs.get(name, {}).get("override")
+        value = self._output(name).get("override")
         return bool(value) if value is not None else None
 
     def input_on(self, name: str) -> Optional[bool]:
@@ -187,7 +213,7 @@ class DeviceState:
         Level" not making that obvious) -- use ``input_triple_level_label``
         for those instead.
         """
-        return units.raw_level_to_on(self.inputs.get(name, {}).get("senseValue"))
+        return units.raw_level_to_on(self._input(name).get("senseValue"))
 
     def input_triple_level_label(self, name: str) -> Optional[str]:
         """Label a tri-state float-switch input's ``senseValue`` (Dry/Wet/Overflow).
@@ -199,7 +225,7 @@ class DeviceState:
         its value. Use ``input_on`` instead for ``bool``-sensorType inputs
         like true leak detectors (firmware type code ``Lek``).
         """
-        return units.triple_level_label(self.inputs.get(name, {}).get("senseValue"))
+        return units.triple_level_label(self._input(name).get("senseValue"))
 
     def alerts(self) -> List[str]:
         """Collect every non-empty alert message across all inputs and outputs.
@@ -213,12 +239,12 @@ class DeviceState:
         """
         found: List[str] = []
         for name, attrs in self.inputs.items():
-            text = str(attrs.get("alert") or "").strip()
+            text = str(_as_dict(attrs).get("alert") or "").strip()
             if text:
                 found.append(f"{name}: {text}")
         for name, attrs in self.outputs.items():
             for key in ("alert", "drainalert", "fillalert"):
-                text = str(attrs.get(key) or "").strip()
+                text = str(_as_dict(attrs).get(key) or "").strip()
                 if not text:
                     continue
                 label = name if key == "alert" else f"{name} ({key[:-len('alert')]})"
@@ -427,8 +453,9 @@ class LogSeries:
         ha-hydros "0.0 mL dosed today (no events)" fallback.
         """
         total = 0.0
-        for _timestamp, _value, message in self.points:
-            dosed_ml = units.parse_dose_ml(message)
+        for point in self.points:
+            message = point[2] if len(point) > 2 else None
+            dosed_ml = units.parse_dose_ml(message if isinstance(message, str) else None)
             if dosed_ml is not None:
                 total += dosed_ml
         return total
@@ -511,7 +538,7 @@ class LogSeriesDiscovery:
 class LogExportResult:
     """Response from ``GET /api/v1/device/logs/export``."""
 
-    url: str
+    url: str = field(repr=False)
     expires_at: int
     format: str
     points: int

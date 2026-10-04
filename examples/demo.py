@@ -3,8 +3,8 @@
 
 Exercises the read-only surface of the library against a real HYDROS
 device: fetches device info, lists overridable outputs, reads the current
-override document, polls live device state for a short window, and queries
-recent log history.
+override document, prints the last hour of logs (``--log-hours`` to change
+the window), and polls live device state for a short window.
 
 This script never calls any *write* endpoint (no overrides are set, no
 commands are sent) so it's safe to run against a live device.
@@ -49,7 +49,9 @@ from pyhydros2 import (
     HydrosClient,
     HydrosError,
     HydrosRateLimitError,
+    LogSeries,
     SessionResponse,
+    units,
 )
 from pyhydros2.const import DEFAULT_BASE_URL, STATE_POLL_MIN_INTERVAL_SECONDS
 
@@ -83,7 +85,17 @@ def _parse_args() -> argparse.Namespace:
         help="Always start a fresh state-polling session instead of reusing "
         "one cached in a tmp file from a previous run.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--log-hours",
+        type=float,
+        default=float(os.environ.get("HYDROS_LOG_HOURS", "1")),
+        help="Hours of log history to print (default: 1, or HYDROS_LOG_HOURS "
+        "from .env)",
+    )
+    args = parser.parse_args()
+    if args.log_hours <= 0:
+        parser.error("--log-hours must be greater than 0")
+    return args
 
 
 def _print_header(title: str) -> None:
@@ -186,18 +198,49 @@ async def _showcase_current_overrides(client: HydrosClient) -> None:
         print(f"- {key}: desired={value.desired} reported={value.reported}")
 
 
-async def _showcase_recent_logs(client: HydrosClient) -> None:
-    _print_header("Recent logs (last hour, 10m resolution)")
-    end = int(time.time())
-    start = end - 3600
-    try:
-        result = await client.query_logs(start, end, resolution="10m")
-    except HydrosError as exc:
-        print(f"(log query failed: {exc})")
+def _format_log_point(series: LogSeries, point: tuple) -> str:
+    value = point[1] if len(point) > 1 else None
+    message = point[2] if len(point) > 2 else ""
+    if series.sensor_type == "bool":
+        return "on" if value else "off"
+    if series.sensor_type == "enum" and series.type == "Ovf":
+        return units.triple_level_label(value) or "None"
+    if series.sensor_type == "event":
+        return message or str(value)
+    return f"{value}  {message}" if message else str(value)
+
+
+async def _showcase_recent_logs(client: HydrosClient, hours: float) -> None:
+    tz_name = datetime.now().astimezone().tzname()
+    _print_header(f"Logs for the last {hours:g} hour(s) (local time, {tz_name})")
+    # The logs endpoints take epoch milliseconds.
+    end = int(time.time() * 1000)
+    start = end - int(hours * 3600 * 1000)
+
+    rows: dict[tuple[int, str], tuple[str, str]] = {}
+    # "10m" has analog readings plus on/off and level changes; dose events only come back with "events".
+    for resolution in ("10m", "events"):
+        try:
+            result = await client.query_logs(start, end, resolution=resolution)
+        except HydrosError as exc:
+            print(f"(log query at {resolution!r} resolution failed: {exc})")
+            continue
+        for name, series in result.series.items():
+            for point in series.points:
+                rows[(point[0], name)] = (series.type, _format_log_point(series, point))
+
+    if not rows:
+        print("(no log entries in this window)")
         return
-    print(f"points={result.points} retention_days={result.retention_days}")
-    for name, series in result.series.items():
-        print(f"- {name} ({series.sensor_type}): {len(series.points)} point(s)")
+
+    width = max(len(f"{name} [{kind}]") for (_, name), (kind, _) in rows.items())
+    for (timestamp, name), (kind, text) in sorted(rows.items()):
+        when = datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{when}  {f'{name} [{kind}]':<{width}}  {text}")
+    print(
+        f"{len(rows)} entries across {len({name for _, name in rows})} series "
+        "(analog values are 10-minute readings; on/off and level changes are exact)"
+    )
 
 
 async def _showcase_dosing_history(client: HydrosClient) -> None:
@@ -339,7 +382,7 @@ async def main() -> int:
         try:
             await _showcase_collectives(client)
             await _showcase_current_overrides(client)
-            await _showcase_recent_logs(client)
+            await _showcase_recent_logs(client, args.log_hours)
             await _showcase_dosing_history(client)
             await _showcase_state_polling(
                 client,

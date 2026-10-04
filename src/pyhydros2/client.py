@@ -12,17 +12,20 @@ Design notes
   several collectives should hold one client per device key.
 - The device *state* document is intentionally opaque (see ``models.DeviceState``).
 - This client does not retry automatically. ``HydrosRateLimitError`` (429)
-  is always transient per the spec; ``HydrosAuthError``/``HydrosForbiddenError``
+  and ``HydrosConnectionError`` (no response/timeout) are transient;
+  ``HydrosAuthError``/``HydrosForbiddenError``
   are not. Callers (or ``poller.DeviceStatePoller`` for the state endpoint)
   decide retry/backoff policy.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
+from contextlib import contextmanager
 from datetime import datetime
 from types import TracebackType
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Type, TypeVar
 from urllib.parse import quote
 
 import aiohttp
@@ -33,6 +36,8 @@ from .exceptions import (
     HydrosAPIError,
     HydrosAuthError,
     HydrosBadRequestError,
+    HydrosConfigError,
+    HydrosConnectionError,
     HydrosForbiddenError,
     HydrosNotFoundError,
     HydrosPayloadTooLargeError,
@@ -64,12 +69,39 @@ _STATUS_EXCEPTIONS = {
 }
 
 
+_T = TypeVar("_T")
+
+
 def _raise_for_status(status: int, payload: Any) -> None:
     message = "HYDROS API error"
     if isinstance(payload, dict) and isinstance(payload.get("error"), str):
         message = payload["error"]
     exc_cls = _STATUS_EXCEPTIONS.get(status, HydrosAPIError)
     raise exc_cls(message, status_code=status, payload=payload)
+
+
+def _parse(parser: Callable[[Any], _T], data: Any) -> _T:
+    """Run a response parser, reporting a malformed body as ``HydrosAPIError``
+    instead of a bare ``KeyError``/``TypeError`` from deep inside a model.
+    """
+    try:
+        return parser(data)
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as err:
+        raise HydrosAPIError(
+            f"Unexpected response from the HYDROS API ({err!r})", payload=data
+        ) from err
+
+
+@contextmanager
+def _wrap_transport_errors(timeout: Optional[float]) -> Iterator[None]:
+    try:
+        yield
+    except asyncio.TimeoutError as err:
+        raise HydrosConnectionError(
+            f"Timed out after {timeout:g}s waiting for the HYDROS API"
+        ) from err
+    except aiohttp.ClientError as err:
+        raise HydrosConnectionError(f"Could not reach the HYDROS API: {err}") from err
 
 
 class HydrosClient:
@@ -90,6 +122,10 @@ class HydrosClient:
         session: Optional[aiohttp.ClientSession] = None,
         request_timeout: float = 10.0,
     ) -> None:
+        if not base_url.lower().startswith("https://"):
+            raise HydrosConfigError(
+                "base_url must use HTTPS: the API keys are sent with every request"
+            )
         self._auth_header = auth.build_provider_v1_header(provider_key, device_key)
         self._base_url = base_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
@@ -136,24 +172,26 @@ class HydrosClient:
         clean_params = (
             {k: v for k, v in params.items() if v is not None} if params else None
         )
-        async with session.request(
-            method,
-            url,
-            params=clean_params,
-            json=json_body,
-            headers=headers,
-            timeout=self._timeout,
-        ) as resp:
-            raw = await resp.read()
-            data: Any = None
-            if raw:
-                try:
-                    data = _json.loads(raw)
-                except ValueError:
-                    data = None
-            if resp.status >= 400:
-                _raise_for_status(resp.status, data)
-            return resp.status, data
+        with _wrap_transport_errors(self._timeout.total):
+            async with session.request(
+                method,
+                url,
+                params=clean_params,
+                json=json_body,
+                headers=headers,
+                timeout=self._timeout,
+            ) as resp:
+                status = resp.status
+                raw = await resp.read()
+        data: Any = None
+        if raw:
+            try:
+                data = _json.loads(raw)
+            except ValueError:
+                data = None
+        if status >= 400:
+            _raise_for_status(status, data)
+        return status, data
 
     # ------------------------------------------------------------------
     # Devices
@@ -162,7 +200,7 @@ class HydrosClient:
     async def get_device(self) -> Device:
         """``GET /api/v1/device`` -- return the device bound to this key."""
         _, data = await self._request("GET", "/api/v1/device")
-        return Device.from_dict(data[0])
+        return _parse(lambda body: Device.from_dict(body[0]), data)
 
     # ------------------------------------------------------------------
     # Sessions / State
@@ -175,7 +213,7 @@ class HydrosClient:
         ``expires_at`` rather than starting a fresh session each poll.
         """
         _, data = await self._request("POST", "/api/v1/device/state/session")
-        return SessionResponse.from_dict(data)
+        return _parse(SessionResponse.from_dict, data)
 
     async def poll_state(self, session: SessionResponse) -> DeviceState:
         """``GET`` the session's ``pollUrl`` using its ``pollToken``.
@@ -190,7 +228,7 @@ class HydrosClient:
             params={"id": session_id},
             bearer=session.poll_token,
         )
-        return DeviceState.from_dict(data)
+        return _parse(DeviceState.from_dict, data)
 
     # ------------------------------------------------------------------
     # Overrides
@@ -199,7 +237,7 @@ class HydrosClient:
     async def get_overrides(self) -> OverrideState:
         """``GET /api/v1/device/overrides`` -- current override document."""
         _, data = await self._request("GET", "/api/v1/device/overrides")
-        return OverrideState.from_dict(data)
+        return _parse(OverrideState.from_dict, data)
 
     async def put_overrides(
         self,
@@ -217,7 +255,7 @@ class HydrosClient:
         _, data = await self._request(
             "PUT", "/api/v1/device/overrides", params=params, json_body=dict(values)
         )
-        return OverrideState.from_dict(data)
+        return _parse(OverrideState.from_dict, data)
 
     async def delete_override(self, key: str, *, receipt: bool = False) -> OverrideState:
         """``DELETE /api/v1/device/overrides/{key}`` -- clear one override."""
@@ -225,7 +263,7 @@ class HydrosClient:
         _, data = await self._request(
             "DELETE", f"/api/v1/device/overrides/{quote(key, safe='')}", params=params
         )
-        return OverrideState.from_dict(data)
+        return _parse(OverrideState.from_dict, data)
 
     async def send_override_command(
         self,
@@ -250,7 +288,7 @@ class HydrosClient:
             params=params,
             json_body=body,
         )
-        return CommandResult.from_dict(data)
+        return _parse(CommandResult.from_dict, data)
 
     async def set_mode(self, mode: str, *, receipt: bool = False) -> CommandResult:
         """Convenience wrapper: flip the device's operating mode.
@@ -266,7 +304,9 @@ class HydrosClient:
         the device is reconfigured, not on every poll.
         """
         _, data = await self._request("GET", "/api/v1/device/overrides/metadata")
-        return [OverrideMetadataEntry.from_dict(item) for item in data]
+        return _parse(
+            lambda body: [OverrideMetadataEntry.from_dict(item) for item in body], data
+        )
 
     # ------------------------------------------------------------------
     # Log Data
@@ -285,7 +325,7 @@ class HydrosClient:
         if names:
             params["name"] = ",".join(names)
         _, data = await self._request("GET", "/api/v1/device/logs", params=params)
-        return LogQueryResult.from_dict(data)
+        return _parse(LogQueryResult.from_dict, data)
 
     async def discover_log_series(
         self,
@@ -297,7 +337,7 @@ class HydrosClient:
         """``GET /api/v1/device/logs/series`` -- discover known series."""
         params = {"start": start, "end": end, "resolution": resolution}
         _, data = await self._request("GET", "/api/v1/device/logs/series", params=params)
-        return LogSeriesDiscovery.from_dict(data)
+        return _parse(LogSeriesDiscovery.from_dict, data)
 
     async def export_logs(
         self,
@@ -324,7 +364,7 @@ class HydrosClient:
         if names:
             params["name"] = ",".join(names)
         _, data = await self._request("GET", "/api/v1/device/logs/export", params=params)
-        return LogExportResult.from_dict(data)
+        return _parse(LogExportResult.from_dict, data)
 
     async def download_export(self, export: LogExportResult) -> bytes:
         """Fetch the file referenced by a ``LogExportResult.url``.
@@ -334,13 +374,15 @@ class HydrosClient:
         if not export.url.startswith("https://"):
             raise HydrosAPIError(f"Export URL must use HTTPS (got {export.url[:40]!r}...)")
         session = self._ensure_session()
-        async with session.get(export.url, timeout=self._timeout) as resp:
-            if resp.status >= 400:
-                raise HydrosAPIError(
-                    f"Failed to download export (HTTP {resp.status})",
-                    status_code=resp.status,
-                )
-            return await resp.read()
+        with _wrap_transport_errors(self._timeout.total):
+            async with session.get(export.url, timeout=self._timeout) as resp:
+                status = resp.status
+                body = await resp.read()
+        if status >= 400:
+            raise HydrosAPIError(
+                f"Failed to download export (HTTP {status})", status_code=status
+            )
+        return body
 
     async def get_dosing_totals_today(
         self,

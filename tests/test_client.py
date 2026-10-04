@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
 
 from pyhydros2 import (
+    HydrosAPIError,
     HydrosAuthError,
     HydrosBadRequestError,
+    HydrosClient,
+    HydrosConfigError,
+    HydrosConnectionError,
     HydrosForbiddenError,
     HydrosNotFoundError,
     HydrosRateLimitError,
@@ -257,3 +263,39 @@ async def test_error_status_mapping(client, mocked, status, exc_cls):
         await client.get_device()
     assert excinfo.value.status_code == status
     assert str(excinfo.value) == "boom"
+
+
+@pytest.mark.parametrize(
+    "error", [aiohttp.ClientConnectionError("down"), asyncio.TimeoutError()]
+)
+async def test_transport_errors_raise_connection_error(client, mocked, error):
+    mocked.get(f"{BASE_URL}/api/v1/device", exception=error)
+    with pytest.raises(HydrosConnectionError) as excinfo:
+        await client.get_device()
+    assert excinfo.value.status_code is None
+    assert isinstance(excinfo.value, HydrosAPIError)
+
+
+@pytest.mark.parametrize("payload", [[], {"unexpected": True}, [{"deviceId": "x"}]])
+async def test_malformed_response_raises_api_error(client, mocked, payload):
+    mocked.get(f"{BASE_URL}/api/v1/device", payload=payload)
+    with pytest.raises(HydrosAPIError, match="Unexpected response"):
+        await client.get_device()
+
+
+async def test_non_json_success_body_raises_api_error(client, mocked):
+    mocked.get(f"{BASE_URL}/api/v1/device/overrides/metadata", body="<html>oops</html>")
+    with pytest.raises(HydrosAPIError, match="Unexpected response"):
+        await client.get_override_metadata()
+
+
+def test_rejects_non_https_base_url():
+    with pytest.raises(HydrosConfigError, match="HTTPS"):
+        HydrosClient("provider", "device", base_url="http://api.coralvuehydros.com")
+
+
+async def test_injected_session_is_not_closed():
+    async with aiohttp.ClientSession() as session:
+        client = HydrosClient("provider", "device", session=session)
+        await client.close()
+        assert not session.closed

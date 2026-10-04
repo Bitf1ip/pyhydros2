@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import timezone
 
+import pytest
+
 from pyhydros2 import Device, DeviceState, OverrideState, SessionResponse
 from pyhydros2.models import LogSeries, OverrideMetadataEntry
 
@@ -57,6 +59,60 @@ def test_device_state_exposes_common_fields():
     assert state.get("version") == "Quatro-380"
     assert state.get("missing", "default") == "default"
 
+
+def test_device_state_tolerates_unexpected_shapes():
+    state = DeviceState.from_dict(
+        {
+            "Input": {"Probe": "not-an-object", "Leak": {"senseValue": 1, "alert": "Wet"}},
+            "Output": {"Pump": None, "Heater": {"valueState": 10000, "alert": "Hot"}},
+            "health": ["unexpected", "list"],
+        }
+    )
+    assert state.output_on("Pump") is None
+    assert state.output_power_watts("Pump") is None
+    assert state.input_on("Probe") is None
+    assert state.health == {}
+    assert state.alerts() == ["Leak: Wet", "Heater: Hot"]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({"mode": "Water Change", "timeout": 3429050}, 3429.05),
+        ({"mode": "Normal"}, None),
+        ({"mode": "Normal", "timeout": 0}, None),
+        ({"timeout": "soon"}, None),
+        ({"timeout": True}, None),
+    ],
+)
+def test_mode_timeout_seconds(raw, expected):
+    assert DeviceState.from_dict(raw).mode_timeout_seconds == expected
+
+
+def test_device_state_from_dict_rejects_non_object():
+    with pytest.raises(TypeError):
+        DeviceState.from_dict(None)
+
+
+def test_bearer_credentials_hidden_from_repr():
+    session = SessionResponse.from_dict(
+        {
+            "pollUrl": "https://api.coralvuehydros.com/api/v1/device/state?id=abc",
+            "pollToken": "secret-poll-token",
+            "durationSeconds": 21600,
+            "pollIntervalSeconds": 30,
+            "expiresAt": "2026-06-27T02:47:01Z",
+        }
+    )
+    assert "secret-poll-token" not in repr(session)
+
+
+def test_total_dose_ml_ignores_points_without_message():
+    series = LogSeries.from_dict(
+        "Doser",
+        {"type": "Dos", "sensorType": "event", "points": [[1, 1], [2, 1, "Manual Dosed 2.5 ml"]]},
+    )
+    assert series.total_dose_ml == 2.5
 
 def test_log_series_total_dose_ml_sums_parsed_events():
     series = LogSeries.from_dict(

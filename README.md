@@ -183,7 +183,7 @@ The API documents two header formats:
 
 ## Demo script (manual smoke test against a real device)
 
-`examples/demo.py` exercises the read-only surface of the library against a real device: the collective and its constituent devices (grouping multi-channel outputs under their parent via override metadata's `parent` field), current overrides, recent logs, and a short window of live state polling. It never calls a write endpoint and is safe to run against a live device.
+`examples/demo.py` exercises the read-only surface of the library against a real device: the collective and its constituent devices (grouping multi-channel outputs under their parent via override metadata's `parent` field), current overrides, the last hour of logs (change the window with `--log-hours` or `HYDROS_LOG_HOURS`), and a short window of live state polling. It never calls a write endpoint and is safe to run against a live device.
 
 Credentials are loaded from a `.env` file (never hard-coded or committed):
 

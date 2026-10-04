@@ -71,3 +71,7 @@ class HydrosRateLimitError(HydrosAPIError):
 
 class HydrosServerError(HydrosAPIError):
     """HTTP 500/502/503: server-side failure; no partial result is returned."""
+
+
+class HydrosConnectionError(HydrosAPIError):
+    """No HTTP response at all: network failure, DNS/TLS error, or timeout. Transient."""
