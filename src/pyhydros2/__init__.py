@@ -41,7 +41,7 @@ from .models import (
 )
 from .poller import DeviceStatePoller
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"  # x-release-please-version
 
 __all__ = [
     "__version__",
